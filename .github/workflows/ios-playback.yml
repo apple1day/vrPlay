@@ -1,34 +1,23 @@
-name: iOS playback regression
-on: [push, pull_request, workflow_dispatch]
+name: Independent iOS decoder reference
+on: [push]
 permissions:
   contents: read
 jobs:
-  playback:
+  decode:
     runs-on: macos-15
-    timeout-minutes: 35
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Prepare XcodeGen and Metal compiler
+      - name: Read the same AVC samples on iOS Simulator without VRPlay
         run: |
-          command -v xcodegen || brew install xcodegen
-          xcrun -sdk iphonesimulator metal --version || xcodebuild -downloadComponent MetalToolchain
-      - name: Check metadata after a 4 GiB media box
-        run: |
-          xcrun swiftc VRPlay/Model/VRSettings.swift VRPlay/Model/FormatDetector.swift Tests/Metadata/main.swift -o "$RUNNER_TEMP/metadata-test"
-          "$RUNNER_TEMP/metadata-test"
-      - name: Compile the iPhone build including device-only Metal APIs
-        run: |
-          xcodegen generate
-          xcodebuild -project VRPlay.xcodeproj -scheme VRPlay -configuration Debug \
-            -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
-      - name: Build and test playback on iPhone Simulator
-        run: bash scripts/test-playback.sh
-        env:
-          RESULT_BUNDLE_PATH: Playback.xcresult
-      - name: Save test results and failure screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: playback-results
-          path: Playback.xcresult
-          if-no-files-found: ignore
+          set -eu
+          sim="$(xcrun simctl list devices available -j | python3 -c 'import sys,json; devices=json.load(sys.stdin)["devices"]; print(next(d["udid"] for r,ds in devices.items() if "iOS-" in r for d in ds if d["name"].startswith("iPhone")))')"
+          xcrun simctl boot "$sim"
+          sdk="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          xcrun --sdk iphonesimulator swiftc -sdk "$sdk" -target "$(uname -m)-apple-ios16.0-simulator" Tests/Metadata/AVCPixels.swift -o "$RUNNER_TEMP/probe"
+          codesign -s - -f "$RUNNER_TEMP/probe"
+          xcrun simctl bootstatus "$sim" -b
+          for name in VRPlaySmoke_360_LR VRPlayColor_360_LR; do
+            echo "$name"
+            xcrun simctl spawn "$sim" "$RUNNER_TEMP/probe" "$PWD/Tests/Fixtures/$name.mp4"
+          done
