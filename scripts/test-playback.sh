@@ -47,7 +47,7 @@ bundle_id="$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$app/Info.pl
 xcrun simctl install "$sim_id" "$app"
 docs="$(xcrun simctl get_app_container "$sim_id" "$bundle_id" data)/Documents"
 mkdir -p "$docs"
-cp Tests/Fixtures/VRPlaySmoke_360_LR.mp4 "$docs/"
+cp Tests/Fixtures/*.mp4 "$docs/"
 printf 'test fixture: invalid movie\n' > "$docs/VRPlaySmoke_Invalid.mp4"
 if [[ -n "${RESULT_BUNDLE_PATH:-}" ]]; then
     build+=(-resultBundlePath "$RESULT_BUNDLE_PATH")

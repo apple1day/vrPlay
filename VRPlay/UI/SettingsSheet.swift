@@ -36,6 +36,10 @@ struct SettingsSheet: View {
                     Toggle("陀螺仪追踪", isOn: $session.settings.gyroEnabled)
                     sliderRow("视场角 FOV", value: $session.settings.fov, range: 50...120, format: "%.0f°")
                     Button("视角回正") { session.recenter() }
+                    Button("用系统播放器查看原始画面") {
+                        session.player.useSystemDisplay()
+                        dismiss()
+                    }
                 }
 
                 Section {

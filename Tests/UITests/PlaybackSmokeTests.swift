@@ -16,14 +16,7 @@ final class PlaybackSmokeTests: XCTestCase {
 
         // The left eye alternates between red and green every two seconds.
         // Measuring two frames on the live screen also catches a frozen first frame.
-        var sawRed = false
-        var sawGreen = false
-        try waitForColors("changing single-eye video") { shot in
-            let color = try self.color(in: shot, at: 0.5)
-            sawRed = sawRed || color == .red
-            sawGreen = sawGreen || color == .green
-            return sawRed && sawGreen
-        }
+        try waitForChangingLeftEye()
 
         let split = app.buttons["playback.split"]
         if !split.isHittable {
@@ -39,6 +32,28 @@ final class PlaybackSmokeTests: XCTestCase {
             let left = try self.color(in: shot, at: 0.25)
             let right = try self.color(in: shot, at: 0.75)
             return (left == .red || left == .green) && right == .blue
+        }
+    }
+
+    @MainActor
+    func test8KMain10VideoDisplaysChangingFrames() throws {
+        try XCTSkipIf(MTLCreateSystemDefaultDevice() == nil,
+                      "This simulator has no Metal device for the GPU playback test.")
+        let app = XCUIApplication()
+        app.launch()
+        try openClip("VRPlay_8K_Main10_360_LR", in: app)
+        try waitForChangingLeftEye()
+    }
+
+    @MainActor
+    private func waitForChangingLeftEye() throws {
+        var sawRed = false
+        var sawGreen = false
+        try waitForColors("changing single-eye video") { shot in
+            let color = try self.color(in: shot, at: 0.5)
+            sawRed = sawRed || color == .red
+            sawGreen = sawGreen || color == .green
+            return sawRed && sawGreen
         }
     }
 
