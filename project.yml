@@ -45,7 +45,10 @@ targets:
   VRPlayUITests:
     type: bundle.ui-testing
     platform: iOS
-    sources: [Tests/UITests]
+    sources:
+      - Tests/UITests
+      - path: Tests/Fixtures/VRPlaySmoke_360_LR.mp4
+        buildPhase: resources
     dependencies:
       - target: VRPlay
     settings:
