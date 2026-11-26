@@ -172,6 +172,11 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
                       self.errorText == nil else { return }
                 self.formatInspection = nil
                 let isAVC = formats?.contains { CMFormatDescriptionGetMediaSubType($0) == kCMVideoCodecType_H264 } == true
+                if isAVC {
+                    item.videoComposition = AVVideoComposition(asset: item.asset, applyingCIFiltersWithHandler: { request in
+                        request.finish(with: request.sourceImage, context: nil)
+                    })
+                }
                 self.startReadyItem(item, preferBGRA: isAVC)
             }
             return
