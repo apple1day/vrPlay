@@ -54,5 +54,6 @@ if [[ -n "${RESULT_BUNDLE_PATH:-}" ]]; then
 fi
 result=0
 xcodebuild "${build[@]}" test-without-building || result=$?
-cat "$docs/pixel-probe.txt" || true
+find "$HOME/Library/Developer/CoreSimulator/Devices/$sim_id/data/Containers/Data/Application" -name pixel-probe.txt -type f -exec cat {} \; || true
+xcrun simctl spawn "$sim_id" log show --style compact --last 7m --predicate 'eventMessage BEGINSWITH "VRPIX"' || true
 exit "$result"

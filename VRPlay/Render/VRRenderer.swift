@@ -228,7 +228,7 @@ final class VRRenderer: NSObject, MTKViewDelegate {
                              w: Int, h: Int, frame: VideoFrame) {
         let split = s.displayMode == .split
         #if targetEnvironment(simulator)
-        if split && ProcessInfo.processInfo.environment["VRPLAY_PIXEL_PROBE"] == "1" &&
+        if split &&
             CACurrentMediaTime() - probeTime > 3 {
             probeTime = CACurrentMediaTime()
             let pb = frame.buffer
@@ -254,6 +254,8 @@ final class VRRenderer: NSObject, MTKViewDelegate {
                 }
             }
             let line = "time=\(session.player.currentTime) fmt=\(fmt) layout=\(s.layout) size=\(frame.width)x\(frame.height) raw=\(pixels)\n"
+            DispatchQueue.main.async { [weak self] in self?.session.player.probeResult = line }
+            NSLog("VRPIX %@", line)
             let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("pixel-probe.txt")
             if let handle = try? FileHandle(forWritingTo: url) {
                 defer { try? handle.close() }

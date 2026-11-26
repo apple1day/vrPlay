@@ -33,6 +33,7 @@ struct PlayerView: View {
                     .transition(.opacity)
             }
             StatusOverlay(player: session.player, onRetry: retryVR)
+            ProbeView(player: session.player).allowsHitTesting(false)
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
@@ -102,6 +103,15 @@ struct PlayerView: View {
         }
         hideWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: work)
+    }
+}
+
+private struct ProbeView: View {
+    @ObservedObject var player: PlayerCore
+    var body: some View {
+        VStack { Spacer()
+            Text(player.probeResult).font(.system(size: 5)).accessibilityIdentifier("vrplay.pixels")
+        }
     }
 }
 

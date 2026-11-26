@@ -42,6 +42,7 @@ final class PlaybackSmokeTests: XCTestCase {
         XCTAssertTrue(split.waitForExistence(timeout: 5))
         split.tap()
         defer {
+            print("APPPROBE", title, app.staticTexts["vrplay.pixels"].label)
             // Exit split mode so its global preference does not affect the next run.
             center.doubleTap()
         }

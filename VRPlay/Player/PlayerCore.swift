@@ -5,6 +5,7 @@ import UIKit
 
 /// All playback controls, output delegate callbacks and MTKView frame pulls run on the main queue.
 final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelegate {
+    @Published var probeResult = "Waiting for probe"
     @Published private(set) var isPlaying = false
     @Published private(set) var isBuffering = false
     @Published private(set) var currentTime: Double = 0
