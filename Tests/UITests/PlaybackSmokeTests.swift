@@ -18,15 +18,17 @@ final class PlaybackSmokeTests: XCTestCase {
         // Measuring two frames on the live screen also catches a frozen first frame.
         try waitForChangingLeftEye()
 
+        // The toolbar auto-hides during playback. Pause the confirmed moving clip so
+        // its split button stays visible between XCTest resolving it and sending the tap.
+        let center = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        center.doubleTap()
         let split = app.buttons["playback.split"]
-        if !split.isHittable {
-            app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
-        }
+        if !split.isHittable { center.tap() }
         XCTAssertTrue(split.waitForExistence(timeout: 5))
         split.tap()
         defer {
             // Exit split mode so its global preference does not affect the next run.
-            app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).doubleTap()
+            center.doubleTap()
         }
         try waitForColors("red or green left eye and blue right eye") { shot in
             let left = try self.color(in: shot, at: 0.25)
