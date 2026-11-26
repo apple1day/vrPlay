@@ -1,3 +1,4 @@
+import AVFoundation
 import SwiftUI
 
 struct PlayerView: View {
@@ -8,17 +9,18 @@ struct PlayerView: View {
     @State private var showControls = true
     @State private var showSettings = false
     @State private var hideWork: DispatchWorkItem?
+    @State private var opened = false
+    @State private var renderAttempt = 0
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            VRMetalView(session: session,
-                        onSingleTap: handleSingleTap,
-                        onDoubleTap: handleDoubleTap)
-                .ignoresSafeArea()
-
-            StatusOverlay(player: session.player)
+            if opened {
+                PlaybackSurface(session: session, player: session.player, attempt: renderAttempt,
+                                onSingleTap: handleSingleTap, onDoubleTap: handleDoubleTap)
+                    .ignoresSafeArea()
+            }
 
             if showControls {
                 ControlsView(session: session,
@@ -26,9 +28,11 @@ struct PlayerView: View {
                              title: item.title,
                              onClose: { dismiss() },
                              onSettings: { showSettings = true },
+                             onRetryVR: retryVR,
                              onInteraction: scheduleHide)
                     .transition(.opacity)
             }
+            StatusOverlay(player: session.player, onRetry: retryVR)
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
@@ -40,12 +44,21 @@ struct PlayerView: View {
             OrientationManager.lock(.landscape)
             UIApplication.shared.isIdleTimerDisabled = true
             session.open(item)
+            opened = true
             scheduleHide()
         }
         .onDisappear {
+            hideWork?.cancel()
+            opened = false
             session.close()
             UIApplication.shared.isIdleTimerDisabled = false
             OrientationManager.lock(.allButUpsideDown)
+        }
+        .onReceive(session.player.$errorText) { error in
+            if error != nil { hideWork?.cancel(); showControls = true }
+        }
+        .onReceive(session.player.$hasPresentedVideo) { presented in
+            if presented { scheduleHide() }
         }
         .onChange(of: showSettings) { open in
             if !open { scheduleHide() } else { hideWork?.cancel() }
@@ -54,7 +67,7 @@ struct PlayerView: View {
 
     // 单屏：单击显示/隐藏控制条；分屏：单击暂停/播放（控制条在分屏里看不到）
     private func handleSingleTap() {
-        if session.settings.displayMode == .split {
+        if !session.player.usesSystemDisplay && session.settings.displayMode == .split {
             session.player.togglePlay()
         } else {
             withAnimation { showControls.toggle() }
@@ -64,7 +77,7 @@ struct PlayerView: View {
 
     // 单屏：双击暂停/播放；分屏：双击退出分屏并显示控制条
     private func handleDoubleTap() {
-        if session.settings.displayMode == .split {
+        if !session.player.usesSystemDisplay && session.settings.displayMode == .split {
             session.settings.displayMode = .single
             withAnimation { showControls = true }
             scheduleHide()
@@ -73,10 +86,17 @@ struct PlayerView: View {
         }
     }
 
+    private func retryVR() {
+        showControls = true
+        renderAttempt += 1
+        session.player.retry()
+    }
+
     private func scheduleHide() {
         hideWork?.cancel()
         let work = DispatchWorkItem {
-            if !showSettings, session.player.isPlaying {
+            if !showSettings, session.player.isPlaying, session.player.hasPresentedVideo,
+               session.player.errorText == nil {
                 withAnimation { showControls = false }
             }
         }
@@ -85,25 +105,94 @@ struct PlayerView: View {
     }
 }
 
-// MARK: - 缓冲 / 错误提示
+private struct PlaybackSurface: View {
+    let session: PlayerSession
+    @ObservedObject var player: PlayerCore
+    let attempt: Int
+    let onSingleTap: () -> Void
+    let onDoubleTap: () -> Void
+
+    var body: some View {
+        if player.usesSystemDisplay {
+            SystemPlayerSurface(player: player)
+                .id(player.videoGeneration)
+                .contentShape(Rectangle())
+                .gesture(TapGesture(count: 2).onEnded { onDoubleTap() }
+                    .exclusively(before: TapGesture().onEnded { onSingleTap() }))
+        } else {
+            VRMetalView(session: session, onSingleTap: onSingleTap, onDoubleTap: onDoubleTap)
+                .id(attempt)
+        }
+    }
+}
+
+private struct SystemPlayerSurface: UIViewRepresentable {
+    let player: PlayerCore
+
+    final class PlayerLayerView: UIView {
+        override class var layerClass: AnyClass { AVPlayerLayer.self }
+        var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+        var observation: NSKeyValueObservation?
+    }
+
+    func makeUIView(context: Context) -> PlayerLayerView {
+        let view = PlayerLayerView()
+        let layer = view.playerLayer
+        layer.videoGravity = .resizeAspect
+        layer.player = player.player
+        let generation = player.videoGeneration
+        view.observation = layer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak player] layer, _ in
+            DispatchQueue.main.async {
+                guard let player, player.videoGeneration == generation, player.usesSystemDisplay,
+                      layer.player === player.player, layer.isReadyForDisplay else { return }
+                player.didPresentSystemFrame()
+            }
+        }
+        return view
+    }
+
+    func updateUIView(_ view: PlayerLayerView, context: Context) {}
+
+    static func dismantleUIView(_ view: PlayerLayerView, coordinator: ()) {
+        view.observation?.invalidate()
+        view.playerLayer.player = nil
+    }
+}
 
 private struct StatusOverlay: View {
     @ObservedObject var player: PlayerCore
+    let onRetry: () -> Void
 
     var body: some View {
-        ZStack {
-            if let err = player.errorText {
-                Text(err)
+        if let error = player.errorText {
+            VStack(spacing: 8) {
+                Text(error)
                     .font(.callout)
-                    .foregroundColor(.white)
-                    .padding(12)
-                    .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 10))
-                    .padding()
-            } else if player.isBuffering {
-                ProgressView().progressViewStyle(.circular).tint(.white).scaleEffect(1.4)
+                    .multilineTextAlignment(.center)
+                    .accessibilityIdentifier("playback.error")
+                HStack {
+                    Button("重试 VR", action: onRetry)
+                    if !player.usesSystemDisplay {
+                        Button("系统平面播放") { player.useSystemDisplay() }
+                    }
+                    Button("复制错误") { UIPasteboard.general.string = error }
+                }
+                .buttonStyle(.bordered)
             }
+            .foregroundColor(.white)
+            .padding(12)
+            .frame(maxWidth: 520)
+            .background(.black.opacity(0.85), in: RoundedRectangle(cornerRadius: 10))
+            .padding(.horizontal)
+        } else if let message = player.startupMessage {
+            ProgressView(message).tint(.white)
+                .foregroundColor(.white)
+                .allowsHitTesting(false)
+        } else if player.isBuffering {
+            ProgressView("缓冲中…").tint(.white)
+                .foregroundColor(.white)
+                .allowsHitTesting(false)
         }
-        .allowsHitTesting(false)
     }
 }
 
@@ -115,6 +204,7 @@ private struct ControlsView: View {
     let title: String
     let onClose: () -> Void
     let onSettings: () -> Void
+    let onRetryVR: () -> Void
     let onInteraction: () -> Void
 
     @State private var scrubbing = false
@@ -140,23 +230,29 @@ private struct ControlsView: View {
     private var topBar: some View {
         HStack(spacing: 18) {
             Button(action: onClose) { Image(systemName: "xmark").font(.title3) }
+                .accessibilityLabel("关闭播放")
+                .accessibilityIdentifier("playback.close")
             Text(title).font(.headline).lineLimit(1)
             Spacer()
-            Button {
-                session.recenter(); onInteraction()
-            } label: { Image(systemName: "scope").font(.title3) }
+            if player.usesSystemDisplay {
+                Button("返回 VR", action: onRetryVR)
+            } else {
+                Button {
+                    session.recenter(); onInteraction()
+                } label: { Image(systemName: "scope").font(.title3) }
 
-            Button {
-                session.settings.displayMode = (session.settings.displayMode == .split) ? .single : .split
-                onInteraction()
-            } label: {
-                Image(systemName: session.settings.displayMode == .split ? "eyeglasses" : "rectangle")
-                    .font(.title3)
-                    .padding(6)
-                    .background(session.settings.displayMode == .split ? Color.accentColor : .clear, in: Circle())
+                Button {
+                    session.settings.displayMode = (session.settings.displayMode == .split) ? .single : .split
+                    onInteraction()
+                } label: {
+                    Image(systemName: session.settings.displayMode == .split ? "eyeglasses" : "rectangle")
+                        .font(.title3)
+                        .padding(6)
+                        .background(session.settings.displayMode == .split ? Color.accentColor : .clear, in: Circle())
+                }
+
+                Button(action: onSettings) { Image(systemName: "slider.horizontal.3").font(.title3) }
             }
-
-            Button(action: onSettings) { Image(systemName: "slider.horizontal.3").font(.title3) }
         }
     }
 

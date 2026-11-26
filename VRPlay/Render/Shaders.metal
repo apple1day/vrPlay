@@ -14,7 +14,8 @@ struct EyeUniforms {
     float2   uvScale;    // 本眼在整张视频纹理里的缩放：SBS=(0.5,1)  TB=(1,0.5)  单眼=(1,1)
     float2   uvOffset;   // 本眼偏移：右眼 SBS=(0.5,0)  TB=(0,0.5)
     float2   uvInset;    // 半个纹素，防止两眼接缝处互相渗色
-    float2   pad;
+    uint     packedRGB;  // BGRA uses a single packed texture
+    uint     pad;
     float4   yuvParams;  // x: yOffset  y: yScale  z: cOffset  w: cScale
     float4   yuvCoeffs;  // x: Cr→R  y: Cb→G  z: Cr→G  w: Cb→B
 };
@@ -40,6 +41,10 @@ fragment float4 vr_fragment(VOut in [[stage_in]],
                             constant EyeUniforms &u [[buffer(1)]]) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     float2 uv = clamp(in.uv, u.uvInset, float2(1.0) - u.uvInset) * u.uvScale + u.uvOffset;
+
+    if (u.packedRGB != 0) {
+        return float4(yTex.sample(s, uv).rgb, 1.0);
+    }
 
     float  y  = (yTex.sample(s, uv).r  - u.yuvParams.x) * u.yuvParams.y;
     float2 c  = (cTex.sample(s, uv).rg - u.yuvParams.z) * u.yuvParams.w;

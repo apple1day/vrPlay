@@ -4,7 +4,7 @@ iOS VR 视频播放器（类似 rPlayer 的核心能力）：360° / VR180 / 平
 
 - 语言 / 框架：Swift 5.9、SwiftUI、Metal、AVFoundation、CoreMotion
 - 最低系统：iOS 16.0（真机；模拟器没有陀螺仪）
-- 播放内核：AVPlayer + `AVPlayerItemVideoOutput`（取 `CVPixelBuffer`，不使用 `AVPlayerLayer`）
+- 播放内核：AVPlayer + `AVPlayerItemVideoOutput` 提供 VR 渲染帧。遇到播放错误时，可切换到 `AVPlayerLayer` 查看原始平面画面。
 
 ## 构建
 
@@ -19,6 +19,12 @@ open VRPlay.xcodeproj
 
 不想用 XcodeGen：新建一个 iOS App（SwiftUI，最低 iOS 16），把 `VRPlay/` 下所有 `.swift` 和 `.metal` 文件拖进去，
 并在 Info.plist 中加入 `project.yml` 里 `info.properties` 的那些键（后台音频、文件共享、ATS 媒体例外、横竖屏）。
+
+## 打开视频后没有画面
+
+播放页会显示正在读取媒体、解码首帧或等待系统显示。VR 模式优先使用解码器提供的像素格式，可以直接渲染 8 位或 10 位双平面 YUV，以及 BGRA。取不到首帧或纹理转换失败时，播放器会尝试一次 8 位兼容输出。
+
+若仍然失败，屏幕会标出出错环节。可以点“重试 VR”，也可以点“系统平面播放”查看原始视频。SBS 文件在系统平面模式中将显示原始并排的两幅画面。点“返回 VR”可重新进入沉浸播放。“复制错误”可保留错误文本，用于排查具体片源。
 
 ## 代码结构
 
@@ -64,7 +70,7 @@ VRPlay/
 - 鱼眼、立方体贴图 / EAC 投影
 - MV-HEVC（Apple 空间视频）
 - 外挂字幕、画中画、AirPlay、锁屏控制
-- HDR 色调映射（目前请求 8 位输出）；8K 视频能否流畅取决于设备硬解能力
+- HDR 色调映射。Metal 屏幕输出为 8 位 SDR。8K 播放取决于设备、编码规格和实际帧率。
 
 ## 需要真机验证的地方
 

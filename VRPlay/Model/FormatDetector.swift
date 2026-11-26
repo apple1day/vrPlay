@@ -129,104 +129,78 @@ struct MP4SpatialMetadata {
         "apch", "apcn", "apcs", "apco", "ap4h"
     ]
 
+    /// Only read box headers and the few bytes describing the projection. A large
+    /// mdat (media) or moov (sample tables) never needs to be copied into memory.
     static func read(from url: URL) -> MP4SpatialMetadata? {
-        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? fh.close() }
-        guard let fileSize = try? fh.seekToEnd() else { return nil }
-
-        var offset: UInt64 = 0
-        while offset + 8 <= fileSize {
-            try? fh.seek(toOffset: offset)
-            guard let head = try? fh.read(upToCount: 16), head.count >= 8 else { break }
-            let b = [UInt8](head)
-            var size = UInt64(be32(b, 0))
-            let type = fourcc(b, 4)
-            var headerLen: UInt64 = 8
-            if size == 1 {
-                guard b.count >= 16 else { break }
-                size = be64(b, 8); headerLen = 16
-            } else if size == 0 {
-                size = fileSize - offset
-            }
-            guard size >= headerLen else { break }
-
-            if type == "moov" {
-                guard size <= 128 * 1024 * 1024 else { return nil }
-                try? fh.seek(toOffset: offset + headerLen)
-                guard let body = try? fh.read(upToCount: Int(size - headerLen)) else { return nil }
-                let bytes = [UInt8](body)
-                var result = MP4SpatialMetadata()
-                parse(bytes, 0, bytes.count, &result)
-                return (result.projection != nil || result.layout != nil) ? result : nil
-            }
-            offset += size
-        }
-        return nil
+        guard let file = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? file.close() }
+        guard let length = try? file.seekToEnd() else { return nil }
+        var remainingBoxes = 16_384
+        var result = MP4SpatialMetadata()
+        visit(file, start: 0, end: length, depth: 0, budget: &remainingBoxes, result: &result)
+        return (result.projection != nil || result.layout != nil) ? result : nil
     }
 
-    private static func parse(_ b: [UInt8], _ start: Int, _ end: Int, _ r: inout MP4SpatialMetadata) {
-        var p = start
-        while p + 8 <= end {
-            var size = Int(be32(b, p))
-            let type = fourcc(b, p + 4)
-            var hl = 8
-            if size == 1 {
-                guard p + 16 <= end else { return }
-                size = Int(be64(b, p + 8)); hl = 16
-            } else if size == 0 {
-                size = end - p
-            }
-            guard size >= hl, p + size <= end else { return }
-            let bs = p + hl, be = p + size
+    private static func bytes(_ file: FileHandle, at offset: UInt64, count: Int) -> [UInt8]? {
+        do {
+            try file.seek(toOffset: offset)
+            guard let data = try file.read(upToCount: count), data.count == count else { return nil }
+            return Array(data)
+        } catch {
+            return nil
+        }
+    }
 
+    private static func integer(_ data: ArraySlice<UInt8>) -> UInt64 {
+        data.reduce(0) { ($0 << 8) | UInt64($1) }
+    }
+
+    private static func visit(_ file: FileHandle, start: UInt64, end: UInt64, depth: Int,
+                              budget: inout Int, result: inout MP4SpatialMetadata) {
+        guard depth < 16 else { return }
+        var offset = start
+        while offset <= end, end - offset >= 8, budget > 0, !Task.isCancelled {
+            budget -= 1
+            guard let header = bytes(file, at: offset, count: 8) else { return }
+            let type = String(decoding: header[4..<8], as: UTF8.self)
+            var size = integer(header[0..<4])
+            var headerSize: UInt64 = 8
+            if size == 1 {
+                guard end - offset >= 16,
+                      let extended = bytes(file, at: offset + 8, count: 8) else { return }
+                size = integer(extended[...])
+                headerSize = 16
+            } else if size == 0 {
+                size = end - offset
+            }
+            guard size >= headerSize, size <= end - offset else { return }
+            let body = offset + headerSize
+            let next = offset + size
+            let payload = next - body
             switch type {
-            case "trak", "mdia", "minf", "stbl", "sv3d", "proj":
-                parse(b, bs, be, &r)
-            case "stsd":
-                parseSampleEntries(b, bs + 8, be, &r)
-            case "st3d":
-                if bs + 5 <= be {
-                    switch b[bs + 4] {
-                    case 0: r.layout = .mono
-                    case 1: r.layout = .topBottom
-                    case 2: r.layout = .sideBySide
+            case "moov", "trak", "mdia", "minf", "stbl", "sv3d", "proj":
+                visit(file, start: body, end: next, depth: depth + 1, budget: &budget, result: &result)
+            case "stsd" where payload >= 8:
+                visit(file, start: body + 8, end: next, depth: depth + 1, budget: &budget, result: &result)
+            case "st3d" where payload >= 5:
+                if let mode = bytes(file, at: body + 4, count: 1)?.first {
+                    switch mode {
+                    case 0: result.layout = .mono
+                    case 1: result.layout = .topBottom
+                    case 2: result.layout = .sideBySide
                     default: break
                     }
                 }
-            case "equi":
-                if bs + 20 <= be {
-                    let l = Double(be32(b, bs + 12)), rr = Double(be32(b, bs + 16))
-                    let coverage = 1.0 - (l + rr) / 4294967296.0
-                    r.projection = coverage < 0.75 ? .hemisphere180 : .sphere360
+            case "equi" where payload >= 20:
+                if let bounds = bytes(file, at: body + 12, count: 8) {
+                    let cropped = integer(bounds[0..<4]) + integer(bounds[4..<8])
+                    result.projection = Double(cropped) / 4294967296.0 > 0.25 ? .hemisphere180 : .sphere360
                 }
+            case _ where videoEntries.contains(type) && payload >= 78:
+                visit(file, start: body + 78, end: next, depth: depth + 1, budget: &budget, result: &result)
             default: break
             }
-            p += size
+            offset = next
         }
-    }
-
-    private static func parseSampleEntries(_ b: [UInt8], _ start: Int, _ end: Int, _ r: inout MP4SpatialMetadata) {
-        var p = start
-        while p + 8 <= end {
-            let size = Int(be32(b, p))
-            let type = fourcc(b, p + 4)
-            guard size >= 8, p + size <= end else { return }
-            if videoEntries.contains(type), size > 8 + 78 {
-                parse(b, p + 8 + 78, p + size, &r)
-            }
-            p += size
-        }
-    }
-
-    private static func be32(_ b: [UInt8], _ i: Int) -> UInt32 {
-        guard i + 4 <= b.count else { return 0 }
-        return (UInt32(b[i]) << 24) | (UInt32(b[i + 1]) << 16) | (UInt32(b[i + 2]) << 8) | UInt32(b[i + 3])
-    }
-    private static func be64(_ b: [UInt8], _ i: Int) -> UInt64 {
-        (UInt64(be32(b, i)) << 32) | UInt64(be32(b, i + 4))
-    }
-    private static func fourcc(_ b: [UInt8], _ i: Int) -> String {
-        guard i + 4 <= b.count else { return "" }
-        return String(bytes: b[i..<(i + 4)], encoding: .isoLatin1) ?? ""
     }
 }

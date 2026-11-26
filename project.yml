@@ -6,9 +6,9 @@ options:
   createIntermediateGroups: true
 settings:
   base:
-    SWIFT_VERSION: "5.9"
-    MARKETING_VERSION: "1.0.0"
-    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0.1"
+    CURRENT_PROJECT_VERSION: "2"
 targets:
   VRPlay:
     type: application
@@ -42,3 +42,20 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
+  VRPlayUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [Tests/UITests]
+    dependencies:
+      - target: VRPlay
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.vrplay.uitests
+schemes:
+  VRPlay:
+    build:
+      targets:
+        VRPlay: all
+    test:
+      targets: [VRPlayUITests]

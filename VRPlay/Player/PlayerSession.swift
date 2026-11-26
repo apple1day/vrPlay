@@ -13,6 +13,10 @@ final class PlayerSession: ObservableObject {
         didSet {
             guard settings != oldValue else { return }
             if Self.tracking(settings) != Self.tracking(oldValue) { needsRecenter = true }
+            if item != nil && (settings.projection != oldValue.projection || settings.layout != oldValue.layout) {
+                hasSavedSettings = true
+                detectionTask?.cancel()
+            }
             persist()
         }
     }
@@ -20,6 +24,8 @@ final class PlayerSession: ObservableObject {
 
     private(set) var item: VideoItem?
     private var hasSavedSettings = false
+    private var detectionTask: Task<Void, Never>?
+    private var detectionID = UUID()
     private var needsRecenter = true
     private var yawOffset: Float = 0
     private var pitch: Float = 0
@@ -29,6 +35,8 @@ final class PlayerSession: ObservableObject {
 
     func open(_ item: VideoItem) {
         bag.removeAll()
+        detectionTask?.cancel()
+        detectionNote = ""
         self.item = nil   // 先置空，避免下面赋值触发持久化
 
         if let saved = SettingsStore.load(for: item.url) {
@@ -36,7 +44,9 @@ final class PlayerSession: ObservableObject {
             settings = saved
         } else {
             hasSavedSettings = false
-            settings = SettingsStore.viewerDefaults() ?? VRSettings()
+            var defaults = VRSettings()
+            if let viewer = SettingsStore.viewerDefaults() { SettingsStore.applyViewer(from: viewer, to: &defaults) }
+            settings = defaults
         }
         self.item = item
         needsRecenter = true
@@ -64,7 +74,9 @@ final class PlayerSession: ObservableObject {
     }
 
     func close() {
+        detectionTask?.cancel()
         savePosition(player.currentTime)
+        item = nil
         tracker.stop()
         player.stop()
         bag.removeAll()
@@ -89,13 +101,26 @@ final class PlayerSession: ObservableObject {
 
     private func applyDetection(size: CGSize?) {
         guard let item else { return }
-        let d = FormatDetector.detect(url: item.url, videoSize: size)
-        detectionNote = "识别依据：\(d.source)"
-        var s = settings
-        s.projection = d.projection
-        s.layout = d.layout
-        s.swapEyes = false
-        settings = s
+        detectionTask?.cancel()
+        let id = UUID()
+        detectionID = id
+        let url = item.url
+        detectionTask = Task.detached(priority: .utility) { [weak self] in
+            let format = FormatDetector.detect(url: url, videoSize: size)
+            guard !Task.isCancelled else { return }
+            await self?.apply(format, for: url, id: id)
+        }
+    }
+
+    @MainActor private func apply(_ format: DetectedFormat, for url: URL, id: UUID) {
+        guard item?.url == url, detectionID == id, detectionTask?.isCancelled == false else { return }
+        detectionTask = nil
+        detectionNote = "识别依据：\(format.source)"
+        var updated = settings
+        updated.projection = format.projection
+        updated.layout = format.layout
+        updated.swapEyes = false
+        settings = updated
     }
 
     // MARK: 视角

@@ -3,138 +3,398 @@ import Combine
 import CoreVideo
 import UIKit
 
-/// 播放核心：AVPlayer + AVPlayerItemVideoOutput。
-/// 不使用 AVPlayerLayer，而是把每一帧的 CVPixelBuffer 交给 Metal 渲染器。
-/// 之后要支持 MKV 等格式，只需要换掉这一层，保持 copyLatestFrame() 接口不变。
-final class PlayerCore: ObservableObject {
+/// All playback controls, output delegate callbacks and MTKView frame pulls run on the main queue.
+final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelegate {
     @Published private(set) var isPlaying = false
     @Published private(set) var isBuffering = false
     @Published private(set) var currentTime: Double = 0
     @Published private(set) var duration: Double = 0
     @Published private(set) var videoSize: CGSize = .zero
     @Published private(set) var errorText: String?
+    @Published private(set) var startupMessage: String?
+    @Published private(set) var hasPresentedVideo = false
+    @Published private(set) var usesSystemDisplay = false
+    @Published private(set) var videoGeneration = UUID()
 
     let player = AVPlayer()
+    private var url: URL?
     private var output: AVPlayerItemVideoOutput?
+    private var requestedPlayback = false
+    private var pendingSeek: Double?
+    private var seeking: UUID?
+    private var triedCompatibleOutput = false
+    private var copiedFrame = false
+    private var nextFirstFrameProbe: CFTimeInterval = 0
+    private var startupTimer: Timer?
+    private var foregroundSeconds = 0
     private var timeObserver: Any?
     private var bag = Set<AnyCancellable>()
     private var itemBag = Set<AnyCancellable>()
-    private var endObserver: NSObjectProtocol?
+    private var trackInspection: Task<Void, Never>?
 
-    init() {
-        player.automaticallyWaitsToMinimizeStalling = true
-
+    override init() {
+        super.init()
         timeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main
-        ) { [weak self] t in
-            let s = t.seconds
-            if s.isFinite { self?.currentTime = s }
+        ) { [weak self] _ in
+            guard let self, self.seeking == nil, self.pendingSeek == nil,
+                  let item = self.player.currentItem, item.status == .readyToPlay else { return }
+            let seconds = item.currentTime().seconds
+            if seconds.isFinite { self.currentTime = max(0, seconds) }
         }
 
         player.publisher(for: \.timeControlStatus)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] status in
-                self?.isPlaying = (status != .paused)
-                self?.isBuffering = (status == .waitingToPlayAtSpecifiedRate)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                let status = self.player.timeControlStatus
+                self.isPlaying = status != .paused
+                self.isBuffering = status == .waitingToPlayAtSpecifiedRate
             }
             .store(in: &bag)
     }
 
     deinit {
-        if let t = timeObserver { player.removeTimeObserver(t) }
-        if let e = endObserver { NotificationCenter.default.removeObserver(e) }
+        startupTimer?.invalidate()
+        trackInspection?.cancel()
+        if let timeObserver { player.removeTimeObserver(timeObserver) }
     }
 
     func load(url: URL, startAt: Double = 0, autoplay: Bool = true) {
-        let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .moviePlayback)
-        try? session.setActive(true)
+        open(url, startAt: startAt, autoplay: autoplay, systemDisplay: false)
+    }
 
-        itemBag.removeAll()
+    private func open(_ url: URL, startAt: Double, autoplay: Bool, systemDisplay: Bool) {
+        tearDownItem()
+        self.url = url
+        usesSystemDisplay = systemDisplay
+        requestedPlayback = autoplay
+        triedCompatibleOutput = false
         errorText = nil
+        currentTime = startAt.isFinite ? max(0, startAt) : 0
+        pendingSeek = currentTime > 0 ? currentTime : nil
         videoSize = .zero
         duration = 0
-        currentTime = 0
+        beginWaiting("正在读取视频…")
 
-        let attrs: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-            kCVPixelBufferMetalCompatibilityKey as String: true,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()
-        ]
-        let out = AVPlayerItemVideoOutput(pixelBufferAttributes: attrs)
-        output = out
+        let audio = AVAudioSession.sharedInstance()
+        try? audio.setCategory(.playback, mode: .moviePlayback)
+        try? audio.setActive(true)
 
         let item = AVPlayerItem(url: url)
-        item.add(out)
-
-        item.publisher(for: \.status)
+        player.replaceCurrentItem(with: item)
+        item.publisher(for: \.status, options: [.initial, .new])
             .receive(on: DispatchQueue.main)
-            .sink { [weak self, weak item] status in
-                guard let self, let item else { return }
-                if status == .failed {
-                    self.errorText = item.error?.localizedDescription ?? "无法播放该文件"
+            .sink { [weak self, weak item] _ in
+                guard let self, let item, self.player.currentItem === item else { return }
+                switch item.status {
+                case .readyToPlay:
+                    guard self.errorText == nil else { return }
+                    if !self.usesSystemDisplay && self.output == nil { self.attachOutput(to: item) }
+                    self.foregroundSeconds = 0
+                    self.startupMessage = self.usesSystemDisplay ? "正在等待系统播放器显示画面…" : "正在解码视频首帧…"
+                    if let seconds = self.pendingSeek { self.seek(to: seconds) }
+                    else { self.applyPlaybackIntent() }
+                case .failed:
+                    self.fail(Self.itemError(item.error))
+                default: break
                 }
             }
             .store(in: &itemBag)
-
         item.publisher(for: \.presentationSize)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] size in
-                if size.width > 0, size.height > 0 { self?.videoSize = size }
+            .sink { [weak self, weak item] size in
+                guard let self, let item, self.player.currentItem === item, size.width > 0, size.height > 0 else { return }
+                self.videoSize = size
             }
             .store(in: &itemBag)
-
         item.publisher(for: \.duration)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] d in
-                if d.seconds.isFinite { self?.duration = d.seconds }
+            .sink { [weak self, weak item] d in
+                guard let self, let item, self.player.currentItem === item, d.seconds.isFinite else { return }
+                self.duration = max(0, d.seconds)
             }
             .store(in: &itemBag)
 
-        if let e = endObserver { NotificationCenter.default.removeObserver(e) }
-        endObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
-        ) { [weak self] _ in
-            self?.player.pause()
-            self?.player.seek(to: .zero)
-        }
+        let center = NotificationCenter.default
+        center.publisher(for: .AVPlayerItemFailedToPlayToEndTime, object: item)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self, weak item] note in
+                guard let self, let item, self.player.currentItem === item else { return }
+                self.fail(Self.itemError(note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error ?? item.error))
+            }
+            .store(in: &itemBag)
+        center.publisher(for: .AVPlayerItemDidPlayToEndTime, object: item)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self, weak item] _ in
+                guard let self, let item, self.player.currentItem === item, self.errorText == nil else { return }
+                if !self.hasPresentedVideo {
+                    // A short track can finish before the first-frame watchdog fires.
+                    if !self.usesSystemDisplay && !self.triedCompatibleOutput && !self.copiedFrame {
+                        self.retryCompatibleOutput(item)
+                        self.seek(to: 0)
+                    } else {
+                        self.fail("媒体已经播完，但未显示任何视频帧。" + self.sizeDescription)
+                    }
+                    return
+                }
+                self.pause()
+                self.seek(to: 0)
+            }
+            .store(in: &itemBag)
 
-        player.replaceCurrentItem(with: item)
-        if startAt > 1 {
-            player.seek(to: CMTime(seconds: startAt, preferredTimescale: 600),
-                        toleranceBefore: .zero, toleranceAfter: .zero)
+        // A local audio-only file can be "ready to play" forever without producing a video frame.
+        // HLS variant tracks may appear dynamically, so only use this test for local files.
+        if url.isFileURL {
+            trackInspection = Task { @MainActor [weak self, weak item] in
+                guard let item, let tracks = try? await item.asset.loadTracks(withMediaType: .video),
+                      !Task.isCancelled, let self, self.player.currentItem === item else { return }
+                if tracks.isEmpty { self.fail("文件中没有可读取的视频轨道。") }
+            }
         }
-        if autoplay { player.play() }
+    }
+
+    private static func itemError(_ error: Error?) -> String {
+        guard let error = error as NSError? else { return "AVFoundation 无法播放此媒体。" }
+        return "AVFoundation：\(error.localizedDescription)（\(error.domain) \(error.code)）"
+    }
+
+    private func attachOutput(to item: AVPlayerItem) {
+        detachOutput()
+        // Let the decoder vend its native depth/range (including 10-bit HEVC).
+        // Force NV12 only on a bounded retry if native delivery or texture creation fails.
+        var attributes: [String: Any] = [
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()
+        ]
+        if triedCompatibleOutput {
+            attributes[kCVPixelBufferPixelFormatTypeKey as String] = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        }
+        let newOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
+        newOutput.suppressesPlayerRendering = true
+        newOutput.setDelegate(self, queue: .main)
+        output = newOutput
+        item.add(newOutput)
+        newOutput.requestNotificationOfMediaDataChange(withAdvanceInterval: 0.03)
+    }
+
+    private func detachOutput() {
+        if let output {
+            output.setDelegate(nil, queue: nil)
+            if let item = player.currentItem, item.outputs.contains(where: { $0 === output }) {
+                item.remove(output)
+            }
+        }
+        output = nil
+    }
+
+    func outputMediaDataWillChange(_ sender: AVPlayerItemOutput) {
+        if sender === output { nextFirstFrameProbe = 0 }
+    }
+
+    func outputSequenceWasFlushed(_ sender: AVPlayerItemOutput) {
+        guard sender === output else { return }
+        copiedFrame = false
+        nextFirstFrameProbe = 0
+    }
+
+    func copyLatestFrame() -> CVPixelBuffer? {
+        guard !usesSystemDisplay, errorText == nil, seeking == nil, pendingSeek == nil,
+              let output, let item = player.currentItem, item.status == .readyToPlay else { return nil }
+        let now = CACurrentMediaTime()
+        let mappedTime = output.itemTime(forHostTime: now)
+        let itemTime = item.currentTime()
+        let time = mappedTime.isNumeric && mappedTime.seconds >= 0 ? mappedTime : itemTime
+        guard time.isNumeric else { return nil }
+        let isNew = output.hasNewPixelBuffer(forItemTime: time)
+        // A paused item or a freshly attached output may lack a host-clock mapping or a "new" flag.
+        // Until acquisition, also ask for the current item frame at most ten times per second.
+        guard isNew || (!copiedFrame && now >= nextFirstFrameProbe) else { return nil }
+        nextFirstFrameProbe = now + 0.1
+        var frame = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil)
+        if frame == nil, !copiedFrame, itemTime.isNumeric, CMTimeCompare(time, itemTime) != 0 {
+            frame = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil)
+        }
+        if frame != nil { copiedFrame = true }
+        return frame
+    }
+
+    private func beginWaiting(_ message: String) {
+        videoGeneration = UUID()
+        copiedFrame = false
+        nextFirstFrameProbe = 0
+        hasPresentedVideo = false
+        startupMessage = message
+        foregroundSeconds = 0
+        startupTimer?.invalidate()
+        startupTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.checkStartup()
+        }
+    }
+
+    private func checkStartup() {
+        guard UIApplication.shared.applicationState == .active, let item = player.currentItem,
+              errorText == nil, !hasPresentedVideo else { return }
+        foregroundSeconds += 1
+        if item.status != .readyToPlay || seeking != nil {
+            if foregroundSeconds >= 30 {
+                fail(seeking == nil ? "等待媒体就绪超过 30 秒。请检查文件或网络后重试。" : "等待定位播放位置超过 30 秒。")
+            }
+            return
+        }
+        if url?.isFileURL == false, player.timeControlStatus == .waitingToPlayAtSpecifiedRate {
+            if foregroundSeconds >= 45 { fail("网络视频缓冲超过 45 秒，尚未显示画面。") }
+            return
+        }
+        if usesSystemDisplay {
+            if foregroundSeconds >= 12 { fail("系统播放器也未显示视频首帧。\(sizeDescription)") }
+        } else if !copiedFrame && !triedCompatibleOutput && foregroundSeconds >= 5 {
+            retryCompatibleOutput(item)
+        } else if foregroundSeconds >= 12 {
+            let detail = copiedFrame ? "已获取视频帧，但 Metal 尚未将画面显示到屏幕。" : "AVFoundation 尚未输出可显示的视频帧。"
+            fail(detail + sizeDescription)
+        }
+    }
+
+    private var sizeDescription: String {
+        guard videoSize.width > 0, videoSize.height > 0 else { return "" }
+        return "（\(Int(videoSize.width)) × \(Int(videoSize.height))）"
+    }
+
+    private func retryCompatibleOutput(_ item: AVPlayerItem) {
+        triedCompatibleOutput = true
+        beginWaiting("正在使用兼容像素格式重新获取画面…")
+        attachOutput(to: item)
+        // Re-request the current sample when the clock is paused; a running clock will advance naturally.
+        if player.timeControlStatus == .paused {
+            let position = item.currentTime()
+            if position.isNumeric { item.seek(to: position, toleranceBefore: .zero, toleranceAfter: .zero, completionHandler: nil) }
+        }
+    }
+
+    func videoTextureFailed(_ detail: String) {
+        guard !usesSystemDisplay, errorText == nil, let item = player.currentItem else { return }
+        if triedCompatibleOutput { fail(detail + sizeDescription) }
+        else { retryCompatibleOutput(item) }
+    }
+
+    func reportRenderFailure(_ message: String) {
+        if !usesSystemDisplay, player.currentItem != nil, errorText == nil { fail(message) }
+    }
+
+    func didPresentVideoFrame() {
+        if !usesSystemDisplay { markPresented() }
+    }
+
+    func didPresentSystemFrame() {
+        if usesSystemDisplay { markPresented() }
+    }
+
+    private func markPresented() {
+        guard player.currentItem != nil, errorText == nil, !hasPresentedVideo else { return }
+        hasPresentedVideo = true
+        startupMessage = nil
+        startupTimer?.invalidate()
+        startupTimer = nil
+    }
+
+    private func fail(_ message: String) {
+        errorText = message
+        startupMessage = nil
+        startupTimer?.invalidate()
+        startupTimer = nil
+        player.pause()
+    }
+
+    private var recoveryPosition: Double {
+        let position = pendingSeek ?? currentTime
+        if duration > 0, position >= duration - 0.05 { return 0 }
+        return position
+    }
+
+    func retry() {
+        guard let url else { return }
+        open(url, startAt: recoveryPosition, autoplay: requestedPlayback, systemDisplay: false)
+    }
+
+    func useSystemDisplay() {
+        guard !usesSystemDisplay, let item = player.currentItem, let url else { return }
+        if item.status == .failed || (errorText != nil && item.status != .readyToPlay) {
+            open(url, startAt: recoveryPosition, autoplay: requestedPlayback, systemDisplay: true)
+            return
+        }
+        detachOutput()
+        usesSystemDisplay = true
+        errorText = nil
+        beginWaiting("正在等待系统播放器显示画面…")
+        if pendingSeek != nil || recoveryPosition != currentTime { seek(to: recoveryPosition) }
+        else { applyPlaybackIntent() }
+    }
+
+    func seek(to seconds: Double) {
+        guard seconds.isFinite, let item = player.currentItem else { return }
+        let end = item.duration.seconds
+        let target = end.isFinite && end > 0 ? min(max(0, seconds), end) : max(0, seconds)
+        currentTime = target
+        guard item.status == .readyToPlay else { pendingSeek = target; return }
+        pendingSeek = nil
+        let token = UUID()
+        seeking = token
+        if !usesSystemDisplay, errorText == nil {
+            beginWaiting("正在定位视频画面…")
+        }
+        let time = CMTime(seconds: target, preferredTimescale: 600)
+        // A small tolerance allows efficient seeks near sync samples in long-GOP HEVC files.
+        let tolerance = CMTime(seconds: 0.15, preferredTimescale: 600)
+        item.seek(to: time, toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self, weak item] _ in
+            DispatchQueue.main.async {
+                guard let self, let item, self.seeking == token, self.player.currentItem === item else { return }
+                self.seeking = nil
+                self.foregroundSeconds = 0
+                self.output?.requestNotificationOfMediaDataChange(withAdvanceInterval: 0.03)
+                self.applyPlaybackIntent()
+            }
+        }
+    }
+
+    private func applyPlaybackIntent() {
+        guard errorText == nil, seeking == nil, player.currentItem?.status == .readyToPlay else { return }
+        if requestedPlayback { player.play() } else { player.pause() }
+    }
+
+    func togglePlay() {
+        let preparing = player.currentItem?.status != .readyToPlay || seeking != nil
+        let running = preparing ? requestedPlayback : player.timeControlStatus != .paused
+        if running { pause() } else { play() }
+    }
+    func play() { requestedPlayback = true; applyPlaybackIntent() }
+    func pause() { requestedPlayback = false; player.pause() }
+
+    func skip(by delta: Double) {
+        seek(to: currentTime + delta)
+    }
+
+    private func tearDownItem() {
+        itemBag.removeAll()
+        trackInspection?.cancel()
+        trackInspection = nil
+        startupTimer?.invalidate()
+        startupTimer = nil
+        seeking = nil
+        pendingSeek = nil
+        player.pause()
+        detachOutput()
+        player.replaceCurrentItem(with: nil)
     }
 
     func stop() {
-        player.pause()
-        player.replaceCurrentItem(with: nil)
-        output = nil
-        itemBag.removeAll()
+        tearDownItem()
+        url = nil
+        videoGeneration = UUID()
+        hasPresentedVideo = false
+        startupMessage = nil
+        errorText = nil
+        requestedPlayback = false
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-    }
-
-    func togglePlay() { isPlaying ? player.pause() : player.play() }
-    func play() { player.play() }
-    func pause() { player.pause() }
-
-    func seek(to seconds: Double) {
-        let t = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
-        player.seek(to: t, toleranceBefore: .zero, toleranceAfter: .zero)
-        currentTime = seconds
-    }
-
-    func skip(by delta: Double) {
-        let target = min(max(0, currentTime + delta), max(duration, 0))
-        seek(to: target)
-    }
-
-    /// 渲染循环每帧调用；返回 nil 表示没有新帧，渲染器继续使用上一帧
-    func copyLatestFrame() -> CVPixelBuffer? {
-        guard let out = output else { return nil }
-        let t = out.itemTime(forHostTime: CACurrentMediaTime())
-        guard t.isValid, out.hasNewPixelBuffer(forItemTime: t) else { return nil }
-        return out.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: nil)
     }
 }
