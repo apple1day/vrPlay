@@ -3,6 +3,15 @@ on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
 jobs:
+  reference:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          for sample in Tests/Fixtures/VRPlaySmoke_360_LR.mp4 Tests/Fixtures/VRPlayAVC_360_LR.mp4; do
+            echo "$sample"
+            xcrun swift Tests/Metadata/VRAssetProbe.swift "$sample"
+          done
   playback:
     runs-on: macos-15
     timeout-minutes: 35

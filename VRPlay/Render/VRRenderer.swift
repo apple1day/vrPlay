@@ -54,6 +54,7 @@ final class VRRenderer: NSObject, MTKViewDelegate {
     private var current: VideoFrame?
 
     private var generation: UUID?
+    private var probeTime: CFTimeInterval = -1
     private var presentedGeneration: UUID?
     private var failedGeneration: UUID?
 
@@ -226,6 +227,41 @@ final class VRRenderer: NSObject, MTKViewDelegate {
     private func encodeScene(_ enc: MTLRenderCommandEncoder, settings s: VRSettings,
                              w: Int, h: Int, frame: VideoFrame) {
         let split = s.displayMode == .split
+        #if targetEnvironment(simulator)
+        if split && ProcessInfo.processInfo.environment["VRPLAY_PIXEL_PROBE"] == "1" &&
+            CACurrentMediaTime() - probeTime > 3 {
+            probeTime = CACurrentMediaTime()
+            let pb = frame.buffer
+            CVPixelBufferLockBaseAddress(pb, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+            let fmt = CVPixelBufferGetPixelFormatType(pb)
+            var pixels = [String]()
+            for fraction in [0.25, 0.75] {
+                if !CVPixelBufferIsPlanar(pb), let address = CVPixelBufferGetBaseAddress(pb) {
+                    let x = Int(Double(frame.width) * fraction), y = frame.height / 2
+                    let p = address.advanced(by: y * CVPixelBufferGetBytesPerRow(pb) + x * 4)
+                        .assumingMemoryBound(to: UInt8.self)
+                    pixels.append("BGRA \(p[0]) \(p[1]) \(p[2]) \(p[3])")
+                } else if CVPixelBufferGetPlaneCount(pb) == 2 {
+                    for i in 0..<2 {
+                        guard let base = CVPixelBufferGetBaseAddressOfPlane(pb, i) else { continue }
+                        let x = Int(Double(CVPixelBufferGetWidthOfPlane(pb, i)) * fraction)
+                        let y = CVPixelBufferGetHeightOfPlane(pb, i) / 2
+                        let sixteen = fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+                        let addr = base.advanced(by: y * CVPixelBufferGetBytesPerRowOfPlane(pb,i) + x * (i+1) * (sixteen ? 2 : 1))
+                        for ch in 0...i { pixels.append(sixteen ? String(addr.assumingMemoryBound(to: UInt16.self)[ch] >> 6) : String(addr.assumingMemoryBound(to: UInt8.self)[ch])) }
+                    }
+                }
+            }
+            let line = "time=\(session.player.currentTime) fmt=\(fmt) layout=\(s.layout) size=\(frame.width)x\(frame.height) raw=\(pixels)\n"
+            let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("pixel-probe.txt")
+            if let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: Data(line.utf8))
+            } else { try? line.write(to: url, atomically: true, encoding: .utf8) }
+        }
+        #endif
         let eyeCount = split ? 2 : 1
         let eyeW = Double(w) / Double(eyeCount)
         let aspect = Float(eyeW / Double(h))

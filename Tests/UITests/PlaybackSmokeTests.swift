@@ -11,6 +11,11 @@ final class PlaybackSmokeTests: XCTestCase {
     }
 
     @MainActor
+    func testTaggedAVC() throws {
+        try verifySingleAndSplitPlayback(of: "VRPlayAVC_360_LR")
+    }
+
+    @MainActor
     func test8KMain10VideoDisplaysChangingFrames() throws {
         try verifySingleAndSplitPlayback(of: "VRPlay_8K_Main10_360_LR")
     }
@@ -20,6 +25,7 @@ final class PlaybackSmokeTests: XCTestCase {
         try XCTSkipIf(MTLCreateSystemDefaultDevice() == nil,
                       "This simulator has no Metal device for the GPU playback test.")
         let app = XCUIApplication()
+        app.launchEnvironment["VRPLAY_PIXEL_PROBE"] = "1"
         app.launch()
         try openClip(title, in: app)
 
@@ -79,6 +85,7 @@ final class PlaybackSmokeTests: XCTestCase {
     @MainActor
     func testInvalidVideoShowsAnErrorAndCanClose() throws {
         let app = XCUIApplication()
+        app.launchEnvironment["VRPLAY_PIXEL_PROBE"] = "1"
         app.launch()
         try openClip(brokenClip, in: app)
         XCTAssertTrue(app.staticTexts["playback.error"].waitForExistence(timeout: 25))

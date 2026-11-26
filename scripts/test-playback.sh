@@ -52,4 +52,7 @@ printf 'test fixture: invalid movie\n' > "$docs/VRPlaySmoke_Invalid.mp4"
 if [[ -n "${RESULT_BUNDLE_PATH:-}" ]]; then
     build+=(-resultBundlePath "$RESULT_BUNDLE_PATH")
 fi
-xcodebuild "${build[@]}" test-without-building
+result=0
+xcodebuild "${build[@]}" test-without-building || result=$?
+cat "$docs/pixel-probe.txt" || true
+exit "$result"
