@@ -250,6 +250,8 @@ private struct ControlsView: View {
                         .padding(6)
                         .background(session.settings.displayMode == .split ? Color.accentColor : .clear, in: Circle())
                 }
+                .accessibilityLabel(session.settings.displayMode == .split ? "退出 VR 分屏" : "进入 VR 分屏")
+                .accessibilityIdentifier("playback.split")
 
                 Button(action: onSettings) { Image(systemName: "slider.horizontal.3").font(.title3) }
             }

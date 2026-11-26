@@ -6,6 +6,7 @@ final class PlaybackSmokeTests: XCTestCase {
     private let workingClip = "VRPlaySmoke_360_LR"
     private let brokenClip = "VRPlaySmoke_Invalid"
 
+    @MainActor
     func testChangingVideoPixelsAreVisibleInThePlayer() throws {
         try XCTSkipIf(MTLCreateSystemDefaultDevice() == nil,
                       "This simulator has no Metal device for the GPU playback test.")
@@ -15,26 +16,47 @@ final class PlaybackSmokeTests: XCTestCase {
 
         // The left eye alternates between red and green every two seconds.
         // Measuring two frames on the live screen also catches a frozen first frame.
-        let deadline = Date().addingTimeInterval(25)
         var sawRed = false
         var sawGreen = false
-        var lastShot = XCUIScreen.main.screenshot()
-        repeat {
-            lastShot = XCUIScreen.main.screenshot()
-            let color = try centerColor(of: lastShot)
-            sawRed = sawRed || (color.red > 100 && color.red > 2 * color.green && color.red > 2 * color.blue)
-            sawGreen = sawGreen || (color.green > 100 && color.green > 2 * color.red && color.green > 2 * color.blue)
-            if sawRed && sawGreen { return }
-            Thread.sleep(forTimeInterval: 0.25)
-        } while Date() < deadline
+        try waitForColors("changing single-eye video") { shot in
+            let color = try self.color(in: shot, at: 0.5)
+            sawRed = sawRed || color == .red
+            sawGreen = sawGreen || color == .green
+            return sawRed && sawGreen
+        }
 
-        let attachment = XCTAttachment(screenshot: lastShot)
-        attachment.name = "Player when expected colors did not appear"
-        attachment.lifetime = .keepAlways
-        add(attachment)
-        XCTFail("Expected changing video pixels. Red seen: \(sawRed), green seen: \(sawGreen).")
+        let split = app.buttons["playback.split"]
+        if !split.isHittable {
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        }
+        XCTAssertTrue(split.waitForExistence(timeout: 5))
+        split.tap()
+        try waitForColors("red or green left eye and blue right eye") { shot in
+            let left = try self.color(in: shot, at: 0.25)
+            let right = try self.color(in: shot, at: 0.75)
+            return (left == .red || left == .green) && right == .blue
+        }
     }
 
+    @MainActor
+    private func waitForColors(_ description: String, matches: (XCUIScreenshot) throws -> Bool) throws {
+        let deadline = Date().addingTimeInterval(25)
+        repeat {
+            let shot = XCUIScreen.main.screenshot()
+            if try matches(shot) { return }
+            if Date() >= deadline {
+                let attachment = XCTAttachment(screenshot: shot)
+                attachment.name = "Expected " + description
+                attachment.lifetime = .keepAlways
+                add(attachment)
+                XCTFail("Did not display " + description)
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        } while true
+    }
+
+    @MainActor
     func testInvalidVideoShowsAnErrorAndCanClose() throws {
         let app = XCUIApplication()
         app.launch()
@@ -46,10 +68,12 @@ final class PlaybackSmokeTests: XCTestCase {
         XCTAssertTrue(clipButton(brokenClip, in: app).waitForExistence(timeout: 5))
     }
 
+    @MainActor
     private func clipButton(_ title: String, in app: XCUIApplication) -> XCUIElement {
         app.buttons.matching(NSPredicate(format: "label CONTAINS %@", title)).firstMatch
     }
 
+    @MainActor
     private func openClip(_ title: String, in app: XCUIApplication) throws {
         let row = clipButton(title, in: app)
         guard row.waitForExistence(timeout: 10) else {
@@ -60,10 +84,19 @@ final class PlaybackSmokeTests: XCTestCase {
         row.tap()
     }
 
-    private func centerColor(of screenshot: XCUIScreenshot) throws -> (red: Int, green: Int, blue: Int) {
-        let image = try XCTUnwrap(screenshot.image.cgImage)
-        let center = CGRect(x: CGFloat(image.width) * 0.35, y: CGFloat(image.height) * 0.35,
-                            width: CGFloat(image.width) * 0.30, height: CGFloat(image.height) * 0.30)
+    private enum Color { case red, green, blue, other }
+
+    @MainActor
+    private func color(in screenshot: XCUIScreenshot, at fraction: CGFloat) throws -> Color {
+        // UIImage.draw applies the screenshot's orientation metadata (landscape playback).
+        let size = CGSize(width: 80, height: 40)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let upright = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            screenshot.image.draw(in: CGRect(origin: .zero, size: size))
+        }
+        let image = try XCTUnwrap(upright.cgImage)
+        let center = CGRect(x: size.width * fraction - 4, y: size.height * 0.5 - 3, width: 8, height: 6)
         let crop = try XCTUnwrap(image.cropping(to: center))
         var pixel = [UInt8](repeating: 0, count: 4)
         // RGBA regardless of the source screenshot's byte order or color space.
@@ -74,6 +107,10 @@ final class PlaybackSmokeTests: XCTestCase {
             ctx.interpolationQuality = .high
             ctx.draw(crop, in: CGRect(x: 0, y: 0, width: 1, height: 1))
         }
-        return (Int(pixel[0]), Int(pixel[1]), Int(pixel[2]))
+        let red = Int(pixel[0]), green = Int(pixel[1]), blue = Int(pixel[2])
+        if red > 100 && red > 2 * max(green, blue) { return .red }
+        if green > 100 && green > 2 * max(red, blue) { return .green }
+        if blue > 100 && blue > 2 * max(red, green) { return .blue }
+        return .other
     }
 }

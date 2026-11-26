@@ -12,7 +12,7 @@ final class PlayerSession: ObservableObject {
     @Published var settings = VRSettings() {
         didSet {
             guard settings != oldValue else { return }
-            if Self.tracking(settings) != Self.tracking(oldValue) { needsRecenter = true }
+            if Self.tracking(settings) != Self.tracking(oldValue) { recenter() }
             if item != nil && (settings.projection != oldValue.projection || settings.layout != oldValue.layout) {
                 hasSavedSettings = true
                 detectionTask?.cancel()
@@ -26,7 +26,9 @@ final class PlayerSession: ObservableObject {
     private var hasSavedSettings = false
     private var detectionTask: Task<Void, Never>?
     private var detectionID = UUID()
-    private var needsRecenter = true
+    private var inverseReferenceHead: simd_float3x3?
+    private var referenceOrientation: UIInterfaceOrientation?
+    private var relativeHead = matrix_identity_float3x3
     private var yawOffset: Float = 0
     private var pitch: Float = 0
     private var bag = Set<AnyCancellable>()
@@ -49,9 +51,7 @@ final class PlayerSession: ObservableObject {
             settings = defaults
         }
         self.item = item
-        needsRecenter = true
-        yawOffset = 0
-        pitch = 0
+        recenter()
 
         player.load(url: item.url, startAt: SettingsStore.position(for: item.url))
         tracker.start()
@@ -134,7 +134,12 @@ final class PlayerSession: ObservableObject {
     /// 单屏平面视频时不响应拖动
     var panAllowed: Bool { !(settings.projection == .flat && settings.displayMode == .single && !trackingActive) }
 
-    func recenter() { needsRecenter = true }
+    func recenter() {
+        inverseReferenceHead = nil
+        relativeHead = matrix_identity_float3x3
+        yawOffset = 0
+        pitch = 0
+    }
 
     func drag(dx: Float, dy: Float) {
         guard panAllowed else { return }
@@ -155,24 +160,21 @@ final class PlayerSession: ObservableObject {
 
     /// 渲染器每帧调用
     func viewMatrix() -> simd_float4x4 {
-        let active = trackingActive
-        var head = matrix_identity_float3x3
-        var haveHead = !active
-        if active, let h = tracker.headRotation(orientation: Self.interfaceOrientation()) {
-            head = h
-            haveHead = true
-        }
-        if needsRecenter && haveHead {
-            needsRecenter = false
-            pitch = 0
-            if active {
-                let f = head * SIMD3<Float>(0, 0, -1)
-                yawOffset = atan2(f.x, -f.z)
-            } else {
-                yawOffset = 0
+        if trackingActive {
+            let orientation = Self.interfaceOrientation()
+            if let head = tracker.headRotation(orientation: orientation) {
+                if let inverseReferenceHead, referenceOrientation == orientation {
+                    relativeHead = inverseReferenceHead * head
+                } else {
+                    // Neutralize all three axes, including the tilt of a phone lying on a desk.
+                    // Capture only the gyro baseline; keep any touch drag made before the first sample.
+                    inverseReferenceHead = head.transpose
+                    referenceOrientation = orientation
+                    relativeHead = matrix_identity_float3x3
+                }
             }
         }
-        let rot = rotationY(yawOffset) * head * rotationX(pitch)
+        let rot = rotationY(yawOffset) * relativeHead * rotationX(pitch)
         return simd_float4x4(rotation: rot.transpose)   // 视图矩阵 = 相机旋转的逆
     }
 }

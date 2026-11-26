@@ -93,8 +93,13 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
                     if !self.usesSystemDisplay && self.output == nil { self.attachOutput(to: item) }
                     self.foregroundSeconds = 0
                     self.startupMessage = self.usesSystemDisplay ? "正在等待系统播放器显示画面…" : "正在解码视频首帧…"
-                    if let seconds = self.pendingSeek { self.seek(to: seconds) }
-                    else { self.applyPlaybackIntent() }
+                    if let saved = self.pendingSeek {
+                        // A URL may now refer to a shorter/replaced file.
+                        let end = item.duration.seconds
+                        self.seek(to: end.isFinite && end > 0 && saved >= end ? 0 : saved)
+                    } else {
+                        self.applyPlaybackIntent()
+                    }
                 case .failed:
                     self.fail(Self.itemError(item.error))
                 default: break
