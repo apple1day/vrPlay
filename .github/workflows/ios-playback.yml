@@ -16,6 +16,11 @@ jobs:
         run: |
           xcrun swiftc VRPlay/Model/VRSettings.swift VRPlay/Model/FormatDetector.swift Tests/Metadata/main.swift -o "$RUNNER_TEMP/metadata-test"
           "$RUNNER_TEMP/metadata-test"
+      - name: Compile the iPhone build including device-only Metal APIs
+        run: |
+          xcodegen generate
+          xcodebuild -project VRPlay.xcodeproj -scheme VRPlay -configuration Debug \
+            -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
       - name: Build and test playback on iPhone Simulator
         run: bash scripts/test-playback.sh
         env:

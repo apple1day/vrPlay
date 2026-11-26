@@ -181,8 +181,7 @@ final class VRRenderer: NSObject, MTKViewDelegate {
         }
 
         if current != nil, presentedGeneration != generation {
-            drawable.addPresentedHandler { [weak self] shown in
-                guard shown.presentedTime > 0 else { return }
+            let markFrameVisible = { [weak self] in
                 DispatchQueue.main.async {
                     guard let self, self.session.player.videoGeneration == generation,
                           self.presentedGeneration != generation, self.failedGeneration != generation else { return }
@@ -190,6 +189,17 @@ final class VRRenderer: NSObject, MTKViewDelegate {
                     self.session.player.didPresentVideoFrame()
                 }
             }
+            #if targetEnvironment(simulator)
+            // Simulator SDKs do not expose MTLDrawable's presentation timestamp.
+            // UI tests independently check the final window pixels.
+            cb.addCompletedHandler { completed in
+                if completed.status == .completed { markFrameVisible() }
+            }
+            #else
+            drawable.addPresentedHandler { shown in
+                if shown.presentedTime > 0 { markFrameVisible() }
+            }
+            #endif
         }
         cb.present(drawable)
         // Keep the pixel buffer and Core Video texture wrappers alive until this draw finishes.

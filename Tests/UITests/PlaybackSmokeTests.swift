@@ -31,6 +31,10 @@ final class PlaybackSmokeTests: XCTestCase {
         }
         XCTAssertTrue(split.waitForExistence(timeout: 5))
         split.tap()
+        defer {
+            // Exit split mode so its global preference does not affect the next run.
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).doubleTap()
+        }
         try waitForColors("red or green left eye and blue right eye") { shot in
             let left = try self.color(in: shot, at: 0.25)
             let right = try self.color(in: shot, at: 0.75)
