@@ -32,7 +32,10 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
     private var itemBag = Set<AnyCancellable>()
     private var trackInspection: Task<Void, Never>?
     #if targetEnvironment(simulator)
-    private var formatInspection: Task<Void, Never>?
+    private var localAVCTrack: AVAssetTrack?
+    private var stillTask: Task<Void, Never>?
+    private var stillRequest: UUID?
+    private var pendingStill: CVPixelBuffer?
     #endif
 
     override init() {
@@ -60,6 +63,9 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
     deinit {
         startupTimer?.invalidate()
         trackInspection?.cancel()
+        #if targetEnvironment(simulator)
+        stillTask?.cancel()
+        #endif
         if let timeObserver { player.removeTimeObserver(timeObserver) }
     }
 
@@ -148,6 +154,17 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
                 guard let item, let tracks = try? await item.asset.loadTracks(withMediaType: .video),
                       !Task.isCancelled, let self, self.player.currentItem === item else { return }
                 if tracks.isEmpty { self.fail("文件中没有可读取的视频轨道。") }
+                #if targetEnvironment(simulator)
+                // Only local AVC needs a substitute still. Normal playback always uses AVPlayer.
+                let selected = item.tracks.first { $0.isEnabled && $0.assetTrack?.mediaType == .video }?.assetTrack
+                guard let track = selected ?? tracks.first,
+                      let formats = try? await track.load(.formatDescriptions), !Task.isCancelled,
+                      self.player.currentItem === item,
+                      formats.contains(where: { CMFormatDescriptionGetMediaSubType($0) == kCMVideoCodecType_H264 })
+                else { return }
+                self.localAVCTrack = track
+                self.requestPausedStill()
+                #endif
             }
         }
     }
@@ -159,28 +176,7 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
 
     private func prepareReadyItem(_ item: AVPlayerItem) {
         guard errorText == nil else { return }
-        #if targetEnvironment(simulator)
-        // Core Video's simulated AVC chroma-plane path can report success yet return
-        // incorrect color in one eye. Request packed RGB for AVC on Simulator only.
-        if !usesSystemDisplay, output == nil,
-           let video = item.tracks.filter({ $0.isEnabled }).compactMap(\.assetTrack).first(where: { $0.mediaType == .video }) {
-            guard formatInspection == nil else { return }
-            formatInspection = Task { @MainActor [weak self, weak item] in
-                let formats = try? await video.load(.formatDescriptions)
-                guard !Task.isCancelled, let self, let item, self.player.currentItem === item,
-                      self.errorText == nil else { return }
-                self.formatInspection = nil
-                let isAVC = formats?.contains { CMFormatDescriptionGetMediaSubType($0) == kCMVideoCodecType_H264 } == true
-                self.startReadyItem(item, preferBGRA: isAVC)
-            }
-            return
-        }
-        #endif
-        startReadyItem(item, preferBGRA: false)
-    }
-
-    private func startReadyItem(_ item: AVPlayerItem, preferBGRA: Bool) {
-        if !usesSystemDisplay, output == nil { attachOutput(to: item, preferBGRA: preferBGRA) }
+        if !usesSystemDisplay, output == nil { attachOutput(to: item) }
         foregroundSeconds = 0
         startupMessage = usesSystemDisplay ? "正在等待系统播放器显示画面…" : "正在解码视频首帧…"
         if let saved = pendingSeek {
@@ -192,7 +188,7 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
         }
     }
 
-    private func attachOutput(to item: AVPlayerItem, preferBGRA: Bool = false) {
+    private func attachOutput(to item: AVPlayerItem) {
         detachOutput()
         // Let the decoder vend its native depth/range (including 10-bit HEVC).
         // Force NV12 only on a bounded retry if native delivery or texture creation fails.
@@ -202,8 +198,6 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
         ]
         if triedCompatibleOutput {
             attributes[kCVPixelBufferPixelFormatTypeKey as String] = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        } else if preferBGRA {
-            attributes[kCVPixelBufferPixelFormatTypeKey as String] = kCVPixelFormatType_32BGRA
         }
         let newOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
         newOutput.suppressesPlayerRendering = true
@@ -236,6 +230,16 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
     func copyLatestFrame() -> CVPixelBuffer? {
         guard !usesSystemDisplay, errorText == nil, seeking == nil, pendingSeek == nil,
               let output, let item = player.currentItem, item.status == .readyToPlay else { return nil }
+        #if targetEnvironment(simulator)
+        if stillRequest != nil {
+            // Retain the renderer’s last frame while reading. After delivering the still once,
+            // keep it displayed until playback or a seek makes this request obsolete.
+            guard let still = pendingStill else { return nil }
+            pendingStill = nil
+            copiedFrame = true
+            return still
+        }
+        #endif
         let now = CACurrentMediaTime()
         let mappedTime = output.itemTime(forHostTime: now)
         let itemTime = item.currentTime()
@@ -255,6 +259,9 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
     }
 
     private func beginWaiting(_ message: String) {
+        #if targetEnvironment(simulator)
+        cancelPausedStill()
+        #endif
         videoGeneration = UUID()
         copiedFrame = false
         nextFirstFrameProbe = 0
@@ -271,12 +278,6 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
         guard UIApplication.shared.applicationState == .active, let item = player.currentItem,
               errorText == nil, !hasPresentedVideo else { return }
         foregroundSeconds += 1
-        #if targetEnvironment(simulator)
-        if formatInspection != nil {
-            if foregroundSeconds >= 30 { fail("等待视频轨道格式超过 30 秒。") }
-            return
-        }
-        #endif
         if item.status != .readyToPlay || seeking != nil {
             if foregroundSeconds >= 30 {
                 fail(seeking == nil ? "等待媒体就绪超过 30 秒。请检查文件或网络后重试。" : "等待定位播放位置超过 30 秒。")
@@ -364,10 +365,6 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
             open(url, startAt: recoveryPosition, autoplay: requestedPlayback, systemDisplay: true)
             return
         }
-        #if targetEnvironment(simulator)
-        formatInspection?.cancel()
-        formatInspection = nil
-        #endif
         detachOutput()
         usesSystemDisplay = true
         errorText = nil
@@ -404,7 +401,14 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
 
     private func applyPlaybackIntent() {
         guard errorText == nil, seeking == nil, player.currentItem?.status == .readyToPlay else { return }
-        if requestedPlayback { player.play() } else { player.pause() }
+        if requestedPlayback {
+            player.play()
+        } else {
+            player.pause()
+            #if targetEnvironment(simulator)
+            requestPausedStill()
+            #endif
+        }
     }
 
     func togglePlay() {
@@ -412,8 +416,86 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
         let running = preparing ? requestedPlayback : player.timeControlStatus != .paused
         if running { pause() } else { play() }
     }
-    func play() { requestedPlayback = true; applyPlaybackIntent() }
-    func pause() { requestedPlayback = false; player.pause() }
+    func play() {
+        #if targetEnvironment(simulator)
+        cancelPausedStill()
+        #endif
+        requestedPlayback = true
+        applyPlaybackIntent()
+    }
+    func pause() {
+        requestedPlayback = false
+        player.pause()
+        #if targetEnvironment(simulator)
+        requestPausedStill()
+        #endif
+    }
+
+    #if targetEnvironment(simulator)
+    private func cancelPausedStill() {
+        stillTask?.cancel()
+        stillTask = nil
+        stillRequest = nil
+        pendingStill = nil
+    }
+
+    /// On Simulator, AVPlayerItemVideoOutput can produce incorrect chroma for a paused
+    /// local H.264 frame in both NV12 and BGRA. Read just that frame independently.
+    private func requestPausedStill() {
+        guard !requestedPlayback, !usesSystemDisplay, stillRequest == nil,
+              errorText == nil, pendingSeek == nil, seeking == nil, let track = localAVCTrack,
+              let item = player.currentItem, item.status == .readyToPlay else { return }
+        let time = item.currentTime()
+        guard time.isNumeric else { return }
+        let asset = item.asset
+        let request = UUID()
+        stillRequest = request
+        stillTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let frame = await Self.readStill(asset: asset, track: track, at: time)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self, self.stillRequest == request else { return }
+                self.stillTask = nil
+                self.pendingStill = frame
+                if frame == nil { self.stillRequest = nil } // Resume normal video output on failure.
+            }
+        }
+    }
+
+    private static func readStill(asset: AVAsset, track: AVAssetTrack, at time: CMTime) async -> CVPixelBuffer? {
+        guard let reader = try? AVAssetReader(asset: asset) else { return nil }
+        let settings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()
+        ]
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { return nil }
+        reader.add(output)
+        // Include the preceding sample interval: the pause rarely lands exactly on a PTS.
+        let lookback = CMTime(seconds: 0.5, preferredTimescale: 600)
+        let start = CMTimeMaximum(.zero, CMTimeSubtract(time, lookback))
+        reader.timeRange = CMTimeRange(start: start, end: CMTimeAdd(time, lookback))
+        return await withTaskCancellationHandler {
+            guard !Task.isCancelled, reader.startReading() else { return nil }
+            defer { reader.cancelReading() }
+            var preceding: CVPixelBuffer?
+            for _ in 0..<256 {
+                guard !Task.isCancelled, let sample = output.copyNextSampleBuffer(),
+                      let image = CMSampleBufferGetImageBuffer(sample) else { break }
+                let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+                if CMTimeCompare(pts, time) > 0 { return preceding ?? image }
+                preceding = image
+                let duration = CMSampleBufferGetDuration(sample)
+                if duration.isNumeric, CMTimeCompare(CMTimeAdd(pts, duration), time) > 0 { return image }
+            }
+            return preceding
+        } onCancel: {
+            reader.cancelReading()
+        }
+    }
+    #endif
 
     func skip(by delta: Double) {
         seek(to: currentTime + delta)
@@ -424,8 +506,8 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
         trackInspection?.cancel()
         trackInspection = nil
         #if targetEnvironment(simulator)
-        formatInspection?.cancel()
-        formatInspection = nil
+        cancelPausedStill()
+        localAVCTrack = nil
         #endif
         startupTimer?.invalidate()
         startupTimer = nil
