@@ -11,6 +11,9 @@ final class PlaybackSmokeTests: XCTestCase {
     }
 
     @MainActor
+    func testModerateAVC() throws { try verifySingleAndSplitPlayback(of: "VRPlayColor_360_LR") }
+
+    @MainActor
     func test8KMain10VideoDisplaysChangingFrames() throws {
         try verifySingleAndSplitPlayback(of: "VRPlay_8K_Main10_360_LR")
     }
