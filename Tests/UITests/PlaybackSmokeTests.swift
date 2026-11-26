@@ -3,18 +3,27 @@ import UIKit
 import XCTest
 
 final class PlaybackSmokeTests: XCTestCase {
-    private let workingClip = "VRPlaySmoke_360_LR"
     private let brokenClip = "VRPlaySmoke_Invalid"
 
     @MainActor
     func testChangingVideoPixelsAreVisibleInThePlayer() throws {
+        try verifySingleAndSplitPlayback(of: "VRPlaySmoke_360_LR")
+    }
+
+    @MainActor
+    func test8KMain10VideoDisplaysChangingFrames() throws {
+        try verifySingleAndSplitPlayback(of: "VRPlay_8K_Main10_360_LR")
+    }
+
+    @MainActor
+    private func verifySingleAndSplitPlayback(of title: String) throws {
         try XCTSkipIf(MTLCreateSystemDefaultDevice() == nil,
                       "This simulator has no Metal device for the GPU playback test.")
         let app = XCUIApplication()
         app.launch()
-        try openClip(workingClip, in: app)
+        try openClip(title, in: app)
 
-        // The left eye alternates between red and green every two seconds.
+        // Both fixtures have an alternating red/green left eye and a solid blue right eye.
         // Measuring two frames on the live screen also catches a frozen first frame.
         try waitForChangingLeftEye()
 
@@ -35,16 +44,6 @@ final class PlaybackSmokeTests: XCTestCase {
             let right = try self.color(in: shot, at: 0.75)
             return (left == .red || left == .green) && right == .blue
         }
-    }
-
-    @MainActor
-    func test8KMain10VideoDisplaysChangingFrames() throws {
-        try XCTSkipIf(MTLCreateSystemDefaultDevice() == nil,
-                      "This simulator has no Metal device for the GPU playback test.")
-        let app = XCUIApplication()
-        app.launch()
-        try openClip("VRPlay_8K_Main10_360_LR", in: app)
-        try waitForChangingLeftEye()
     }
 
     @MainActor

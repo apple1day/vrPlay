@@ -31,6 +31,9 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
     private var bag = Set<AnyCancellable>()
     private var itemBag = Set<AnyCancellable>()
     private var trackInspection: Task<Void, Never>?
+    #if targetEnvironment(simulator)
+    private var formatInspection: Task<Void, Never>?
+    #endif
 
     override init() {
         super.init()
@@ -89,17 +92,7 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
                 guard let self, let item, self.player.currentItem === item else { return }
                 switch item.status {
                 case .readyToPlay:
-                    guard self.errorText == nil else { return }
-                    if !self.usesSystemDisplay && self.output == nil { self.attachOutput(to: item) }
-                    self.foregroundSeconds = 0
-                    self.startupMessage = self.usesSystemDisplay ? "正在等待系统播放器显示画面…" : "正在解码视频首帧…"
-                    if let saved = self.pendingSeek {
-                        // A URL may now refer to a shorter/replaced file.
-                        let end = item.duration.seconds
-                        self.seek(to: end.isFinite && end > 0 && saved >= end ? 0 : saved)
-                    } else {
-                        self.applyPlaybackIntent()
-                    }
+                    self.prepareReadyItem(item)
                 case .failed:
                     self.fail(Self.itemError(item.error))
                 default: break
@@ -164,7 +157,42 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
         return "AVFoundation：\(error.localizedDescription)（\(error.domain) \(error.code)）"
     }
 
-    private func attachOutput(to item: AVPlayerItem) {
+    private func prepareReadyItem(_ item: AVPlayerItem) {
+        guard errorText == nil else { return }
+        #if targetEnvironment(simulator)
+        // Core Video's simulated AVC chroma-plane path can report success yet return
+        // incorrect color in one eye. Request packed RGB for AVC on Simulator only.
+        if !usesSystemDisplay, output == nil,
+           let video = item.tracks.filter({ $0.isEnabled }).compactMap(\.assetTrack).first(where: { $0.mediaType == .video }) {
+            guard formatInspection == nil else { return }
+            formatInspection = Task { @MainActor [weak self, weak item] in
+                let formats = try? await video.load(.formatDescriptions)
+                guard !Task.isCancelled, let self, let item, self.player.currentItem === item,
+                      self.errorText == nil else { return }
+                self.formatInspection = nil
+                let isAVC = formats?.contains { CMFormatDescriptionGetMediaSubType($0) == kCMVideoCodecType_H264 } == true
+                self.startReadyItem(item, preferBGRA: isAVC)
+            }
+            return
+        }
+        #endif
+        startReadyItem(item, preferBGRA: false)
+    }
+
+    private func startReadyItem(_ item: AVPlayerItem, preferBGRA: Bool) {
+        if !usesSystemDisplay, output == nil { attachOutput(to: item, preferBGRA: preferBGRA) }
+        foregroundSeconds = 0
+        startupMessage = usesSystemDisplay ? "正在等待系统播放器显示画面…" : "正在解码视频首帧…"
+        if let saved = pendingSeek {
+            // A URL may now refer to a shorter/replaced file.
+            let end = item.duration.seconds
+            seek(to: end.isFinite && end > 0 && saved >= end ? 0 : saved)
+        } else {
+            applyPlaybackIntent()
+        }
+    }
+
+    private func attachOutput(to item: AVPlayerItem, preferBGRA: Bool = false) {
         detachOutput()
         // Let the decoder vend its native depth/range (including 10-bit HEVC).
         // Force NV12 only on a bounded retry if native delivery or texture creation fails.
@@ -174,6 +202,8 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
         ]
         if triedCompatibleOutput {
             attributes[kCVPixelBufferPixelFormatTypeKey as String] = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        } else if preferBGRA {
+            attributes[kCVPixelBufferPixelFormatTypeKey as String] = kCVPixelFormatType_32BGRA
         }
         let newOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
         newOutput.suppressesPlayerRendering = true
@@ -241,6 +271,12 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
         guard UIApplication.shared.applicationState == .active, let item = player.currentItem,
               errorText == nil, !hasPresentedVideo else { return }
         foregroundSeconds += 1
+        #if targetEnvironment(simulator)
+        if formatInspection != nil {
+            if foregroundSeconds >= 30 { fail("等待视频轨道格式超过 30 秒。") }
+            return
+        }
+        #endif
         if item.status != .readyToPlay || seeking != nil {
             if foregroundSeconds >= 30 {
                 fail(seeking == nil ? "等待媒体就绪超过 30 秒。请检查文件或网络后重试。" : "等待定位播放位置超过 30 秒。")
@@ -328,6 +364,10 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
             open(url, startAt: recoveryPosition, autoplay: requestedPlayback, systemDisplay: true)
             return
         }
+        #if targetEnvironment(simulator)
+        formatInspection?.cancel()
+        formatInspection = nil
+        #endif
         detachOutput()
         usesSystemDisplay = true
         errorText = nil
@@ -383,6 +423,10 @@ final class PlayerCore: NSObject, ObservableObject, AVPlayerItemOutputPullDelega
         itemBag.removeAll()
         trackInspection?.cancel()
         trackInspection = nil
+        #if targetEnvironment(simulator)
+        formatInspection?.cancel()
+        formatInspection = nil
+        #endif
         startupTimer?.invalidate()
         startupTimer = nil
         seeking = nil
